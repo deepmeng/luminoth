@@ -72,7 +72,7 @@ class FasterRCNNNetworkTest(tf.test.TestCase):
                     'background_threshold_high': 0.5,
                     'background_threshold_low': 0.1,
                 }
-             },
+            },
             'rpn': {
                 'num_channels': 512,
                 'kernel_shape': [3, 3],
@@ -108,7 +108,7 @@ class FasterRCNNNetworkTest(tf.test.TestCase):
                     'foreground_fraction': 0.5,
                     'minibatch_size': 256,
                 }
-             }
+            }
         })
         self.image_size = (600, 800)
         self.image = np.random.randint(low=0, high=255, size=(1, 600, 800, 3))
@@ -145,6 +145,23 @@ class FasterRCNNNetworkTest(tf.test.TestCase):
             sess.run(tf.global_variables_initializer())
             results = sess.run(results)
             return results
+
+    def _get_losses(self, prediction_dict):
+        image = tf.placeholder(
+            tf.float32, shape=self.image.shape)
+        gt_boxes = tf.placeholder(
+            tf.float32, shape=self.gt_boxes.shape)
+        model = FasterRCNN(self.config)
+        results = model(image, gt_boxes)
+        all_losses = model.loss(prediction_dict, return_all=True)
+        with self.test_session() as sess:
+            sess.run(tf.global_variables_initializer())
+            sess.run(results, feed_dict={
+                gt_boxes: self.gt_boxes,
+                image: self.image,
+            })
+            all_losses = sess.run(all_losses)
+            return all_losses
 
     def testBasic(self):
         """
