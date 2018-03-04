@@ -1,17 +1,19 @@
 import sonnet as snt
+import tempfile
 import tensorflow as tf
 
 from easydict import EasyDict
 from luminoth.train import run
-from luminoth.utils.config import get_base_config
+from luminoth.models import get_model
+from luminoth.utils.config import (
+    get_model_config, load_config_files, get_base_config
+)
 
 
 class MockFasterRCNN(snt.AbstractModule):
     """
     Mocks Faster RCNN Network
     """
-    base_config = get_base_config('luminoth/models/fasterrcnn/')
-
     def __init__(self, config, name='mockfasterrcnn'):
         super(MockFasterRCNN, self).__init__(name=name)
         self._config = config
@@ -31,7 +33,7 @@ class MockFasterRCNN(snt.AbstractModule):
 
     @property
     def summary(self):
-        return tf.summary.scalar('dummy', 1)
+        return tf.summary.scalar('dummy', 1, collections=['rcnn'])
 
 
 class TrainTest(tf.test.TestCase):
@@ -39,17 +41,17 @@ class TrainTest(tf.test.TestCase):
     Basic test to train module
     """
     def setUp(self):
+        self.total_epochs = 2
         self.config = EasyDict({
             'model_type': 'fasterrcnn',
             'dataset_type': '',
-            'config_file': None,
-            'override_params': ['train.num_epochs=2'],
-            'run_name': 'mock',
-            'save_summaries_secs': None,
+            'config_files': (),
+            'override_params': [],
             'base_network': {
                 'download': False
             }
         })
+        tf.reset_default_graph()
 
     def get_dataset(self, dataset_type):
         """
@@ -88,14 +90,64 @@ class TrainTest(tf.test.TestCase):
         """
         return MockFasterRCNN
 
+    def get_config(self, model_type, override_params=None):
+        custom_config = load_config_files(self.config.config_files)
+        model_class = get_model('fasterrcnn')
+        model_base_config = get_base_config(model_class)
+        config = get_model_config(
+            model_base_config, custom_config, override_params
+        )
+
+        config.model.type = model_type
+
+        return config
+
     def testTrain(self):
-        config = self.config
+        model_type = 'mockfasterrcnn'
+
+        override_params = [
+            'train.num_epochs={}'.format(self.total_epochs),
+            'train.job_dir=',
+        ]
+
+        config = self.get_config(model_type, override_params=override_params)
 
         # This should not fail
-        run(config.model_type, config.dataset_type, config.config_file,
-            config.override_params, run_name=config.run_name,
-            save_summaries_secs=config.save_summaries_secs,
-            get_dataset_fn=self.get_dataset, get_model_fn=self.get_model)
+        run(
+            config, get_dataset_fn=self.get_dataset,
+            get_model_fn=self.get_model
+        )
+
+    def testTrainSave(self):
+        model_type = 'mockfasterrcnn'
+
+        # Save checkpoints to a temp directory.
+        tmp_job_dir = tempfile.mkdtemp()
+        override_params = [
+            'train.num_epochs={}'.format(self.total_epochs),
+            'train.job_dir={}'.format(tmp_job_dir),
+            'train.run_name=test_runname',
+        ]
+
+        config = self.get_config(model_type, override_params=override_params)
+
+        step = run(
+            config,
+            get_dataset_fn=self.get_dataset, get_model_fn=self.get_model
+        )
+        self.assertEqual(step, 2)
+
+        # We have to reset the graph to avoid having duplicate names.
+        tf.reset_default_graph()
+        step = run(
+            config,
+            get_dataset_fn=self.get_dataset, get_model_fn=self.get_model
+        )
+
+        # This is because of a MonitoredTrainingSession "bug".
+        # When ending training it saves a checkpoint as the next step.
+        # That causes that we are one step ahead when loading it.
+        self.assertEqual(step, 5)
 
 
 if __name__ == '__main__':

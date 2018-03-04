@@ -12,40 +12,53 @@ from luminoth.utils.vars import (
 
 
 class RCNN(snt.AbstractModule):
-    """RCNN: Region-based Convolutional Neural Network
+    """RCNN: Region-based Convolutional Neural Network.
 
-    Given a number of proposals (bounding boxes on an image) and a feature map
-    of that image, RCNN adjust the bounding box and classifies the region as
-    either background or a specific class.
+    Given region proposals (bounding boxes on an image) and a feature map of
+    that image, RCNN adjusts the bounding boxes and classifies each region as
+    either background or a specific object class.
 
-    These are the steps for classifying the images:
-        - Region of Interest Pooling. It extracts features from the feature map
-        based on the proposals into a fixed size (applying extrapolation).
-        - Uses two fully connected layers to generate a smaller Tensor for each
-        region
-        - Finally, a fully conected layer for classifying the class (adding
-        background as a possible class), and a regression for adjusting the
-        bounding box, one 4-d regression for each one of the possible classes.
-        - Using the class probability and the corresponding bounding box
-        regression it, in case of not classifying the region as background it
-        generates the final object bounding box with class and class
-        probability assigned to it.
+    Steps:
+        1. Region of Interest Pooling. Extract features from the feature map
+           (based on the proposals) and convert into fixed size tensors
+           (applying extrapolation).
+        2. Two fully connected layers generate a smaller tensor for each
+           region.
+        3. A fully conected layer outputs the probability distribution over the
+           classes (plus a background class), and another fully connected layer
+           outputs the bounding box regressions (one 4-d regression for each of
+           the possible classes).
+
+    Using the class probability, filter regions classified as background. For
+    the remaining regions, use the class probability together with the
+    corresponding bounding box regression offsets to generate the final object
+    bounding boxes, with classes and probabilities assigned.
     """
 
     def __init__(self, num_classes, config, debug=False, seed=None,
                  name='rcnn'):
         super(RCNN, self).__init__(name=name)
         self._num_classes = num_classes
-        # List of the fully connected layer sized used before classifying and
+        # List of the fully connected layer sizes used before classifying and
         # adjusting the bounding box.
         self._layer_sizes = config.layer_sizes
         self._activation = get_activation_function(config.activation_function)
-        self._dropout_keep_prob = config.dropout_keep_prop
+        self._dropout_keep_prob = config.dropout_keep_prob
         self._use_mean = config.use_mean
 
-        self.initializer = get_initializer(config.initializer, seed=seed)
+        self._rcnn_initializer = get_initializer(
+            config.rcnn_initializer, seed=seed
+        )
+        self._cls_initializer = get_initializer(
+            config.cls_initializer, seed=seed
+        )
+        self._bbox_initializer = get_initializer(
+            config.bbox_initializer, seed=seed
+        )
         self.regularizer = tf.contrib.layers.l2_regularizer(
             scale=config.l2_regularization_scale)
+
+        self._l1_sigma = config.l1_sigma
 
         # Debug mode makes the module return more detailed Tensors which can be
         # useful for debugging.
@@ -54,13 +67,13 @@ class RCNN(snt.AbstractModule):
         self._seed = seed
 
     def _instantiate_layers(self):
-        # We define layers as an array since they are simple fully conected
+        # We define layers as an array since they are simple fully connected
         # ones and it should be easy to tune it from the network config.
         self._layers = [
             snt.Linear(
                 layer_size,
-                name="fc_{}".format(i),
-                initializers={'w': self.initializer},
+                name='fc_{}'.format(i),
+                initializers={'w': self._rcnn_initializer},
                 regularizers={'w': self.regularizer},
             )
             for i, layer_size in enumerate(self._layer_sizes)
@@ -69,8 +82,8 @@ class RCNN(snt.AbstractModule):
         # since we want to be able to predict if the proposal is background as
         # well.
         self._classifier_layer = snt.Linear(
-            self._num_classes + 1, name="fc_classifier",
-            initializers={'w': self.initializer},
+            self._num_classes + 1, name='fc_classifier',
+            initializers={'w': self._cls_initializer},
             regularizers={'w': self.regularizer},
         )
 
@@ -78,8 +91,8 @@ class RCNN(snt.AbstractModule):
         # We choose which to use depending on the output of the classifier
         # layer
         self._bbox_layer = snt.Linear(
-            self._num_classes * 4, name="fc_bbox",
-            initializers={'w': self.initializer},
+            self._num_classes * 4, name='fc_bbox',
+            initializers={'w': self._bbox_initializer},
             regularizers={'w': self.regularizer}
         )
 
@@ -97,28 +110,29 @@ class RCNN(snt.AbstractModule):
             self._num_classes, self._config.proposals
         )
 
-    def _build(self, conv_feature_map, proposals, im_shape,
+    def _build(self, conv_feature_map, proposals, im_shape, base_network,
                gt_boxes=None, is_training=False):
         """
-        Classifies proposals based on the pooled feature map.
+        Classifies & refines proposals based on the pooled feature map.
 
         Args:
-            conv_feature_map: The feature map of the image extracted
+            conv_feature_map: The feature map of the image, extracted
                 using the pretrained network.
-                Shape (num_proposals, pool_height, pool_width, 512).
-            proposals: A Tensor with the bounding boxes proposed by de RPN. Its
-                shape is (total_num_proposals, 4) using the encoding
-                (x1, y1, x2, y2).
+                Shape: (num_proposals, pool_height, pool_width, 512).
+            proposals: A Tensor with the bounding boxes proposed by the RPN.
+                Shape: (total_num_proposals, 4).
+                Encoding: (x1, y1, x2, y2).
             im_shape: A Tensor with the shape of the image in the form of
-                (image_height, image_width)
+                (image_height, image_width).
             gt_boxes (optional): A Tensor with the ground truth boxes of the
-                image. Its shape is (total_num_gt, 5), using the encoding
-                (x1, y1, x2, y2, label).
+                image.
+                Shape: (total_num_gt, 5).
+                Encoding: (x1, y1, x2, y2, label).
             is_training (optional): A boolean to determine if we are just using
-                the module for training or for complete object inference.
+                the module for training or just inference.
 
         Returns:
-            prediction_dict a dict with the object predictions.
+            prediction_dict: a dict with the object predictions.
                 It should have the keys:
                 objects:
                 labels:
@@ -154,44 +168,51 @@ class RCNN(snt.AbstractModule):
                 'bbox_offsets': bbox_offsets_target,
             }
 
-        roi_prediction = self._roi_pool(
-            proposals, conv_feature_map,
-            im_shape
-        )
+        roi_prediction = self._roi_pool(proposals, conv_feature_map, im_shape)
 
         if self._debug:
             # Save raw roi prediction in debug mode.
             prediction_dict['_debug']['roi'] = roi_prediction
 
         pooled_features = roi_prediction['roi_pool']
+        features = base_network._build_tail(
+            pooled_features, is_training=is_training
+        )
 
         if self._use_mean:
             # We avg our height and width dimensions for a more
             # "memory-friendly" Tensor.
-            pooled_features = tf.reduce_mean(
-                pooled_features, [1, 2], keep_dims=True
-            )
+            features = tf.reduce_mean(features, [1, 2])
 
         # We treat num proposals as batch number so that when flattening we
         # get a (num_proposals, flatten_pooled_feature_map_size) Tensor.
-        flatten_features = tf.contrib.layers.flatten(pooled_features)
+        flatten_features = tf.contrib.layers.flatten(features)
         net = tf.identity(flatten_features)
+
+        if is_training:
+            net = tf.nn.dropout(net, keep_prob=self._dropout_keep_prob)
 
         if self._debug:
             prediction_dict['_debug']['flatten_net'] = net
 
-        # After flattening we are left with a
-        # (num_proposals, pool_height * pool_width * 512) Tensor.
+        # After flattening we are left with a Tensor of shape
+        # (num_proposals, pool_height * pool_width * 512).
         # The first dimension works as batch size when applied to snt.Linear.
         for i, layer in enumerate(self._layers):
             # Through FC layer.
             net = layer(net)
+
+            # Apply activation and dropout.
+            variable_summaries(
+                net, 'fc_{}_preactivationout'.format(i), 'reduced'
+            )
+            net = self._activation(net)
             if self._debug:
                 prediction_dict['_debug']['layer_{}_out'.format(i)] = net
 
-            # Apply activation and dropout.
-            net = self._activation(net)
-            net = tf.nn.dropout(net, keep_prob=self._dropout_keep_prob)
+            variable_summaries(net, 'fc_{}_out'.format(i), 'reduced')
+            if is_training:
+                net = tf.nn.dropout(net, keep_prob=self._dropout_keep_prob)
 
         cls_score = self._classifier_layer(net)
         cls_prob = tf.nn.softmax(cls_score, dim=1)
@@ -218,12 +239,13 @@ class RCNN(snt.AbstractModule):
             prediction_dict['_debug']['proposal'] = proposals_pred
 
         # Calculate summaries for results
-        variable_summaries(cls_prob, 'cls_prob', ['rcnn'])
-        variable_summaries(bbox_offsets, 'bbox_offsets', ['rcnn'])
-        variable_summaries(pooled_features, 'pooled_features', ['rcnn'])
+        variable_summaries(cls_prob, 'cls_prob', 'reduced')
+        variable_summaries(bbox_offsets, 'bbox_offsets', 'reduced')
 
-        layer_summaries(self._classifier_layer, ['rcnn'])
-        layer_summaries(self._bbox_layer, ['rcnn'])
+        if self._debug:
+            variable_summaries(pooled_features, 'pooled_features', 'full')
+            layer_summaries(self._classifier_layer, 'full')
+            layer_summaries(self._bbox_layer, 'full')
 
         return prediction_dict
 
@@ -241,15 +263,16 @@ class RCNN(snt.AbstractModule):
                     cls_prob: shape (num_proposals, num_classes + 1)
                         Application of softmax on cls_score.
 
-                    cls_target: shape (num_proposals,)
-                        Has the correct label for each of the proposals.
-                        0 => background
-                        1..n => 1-indexed classes
-                target:
                     bbox_offsets: shape (num_proposals, num_classes * 4)
                         Has the offset for each proposal for each class.
                         We have to compare only the proposals labeled with the
                         offsets for that label.
+
+                target:
+                    cls_target: shape (num_proposals,)
+                        Has the correct label for each of the proposals.
+                        0 => background
+                        1..n => 1-indexed classes
 
                     bbox_offsets_target: shape (num_proposals, 4)
                         Has the true offset of each proposal for the true
@@ -360,7 +383,9 @@ class RCNN(snt.AbstractModule):
             # offsets (that means, the useful results) and the labeled
             # targets.
             reg_loss_per_proposal = smooth_l1_loss(
-                bbox_offset_cleaned, bbox_offsets_target_labeled)
+                bbox_offset_cleaned, bbox_offsets_target_labeled,
+                sigma=self._l1_sigma
+            )
 
             tf.summary.scalar(
                 'rcnn_foreground_samples',
@@ -377,6 +402,6 @@ class RCNN(snt.AbstractModule):
                 )
 
             return {
-                'rcnn_cls_loss': tf.reduce_sum(cross_entropy_per_proposal),
-                'rcnn_reg_loss': tf.reduce_sum(reg_loss_per_proposal),
+                'rcnn_cls_loss': tf.reduce_mean(cross_entropy_per_proposal),
+                'rcnn_reg_loss': tf.reduce_mean(reg_loss_per_proposal),
             }

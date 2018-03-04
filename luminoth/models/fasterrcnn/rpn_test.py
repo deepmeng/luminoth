@@ -17,7 +17,10 @@ class RPNTest(tf.test.TestCase):
             'num_channels': 512,
             'kernel_shape': [3, 3],
             'rpn_initializer': {
-                'type': 'glorot_uniform_initializer',
+                'type': 'variance_scaling_initializer',
+                'factor': 1.0,
+                'mode': 'FAN_AVG',
+                'uniform': True,
             },
             'cls_initializer': {
                 'type': 'truncated_normal_initializer',
@@ -30,6 +33,7 @@ class RPNTest(tf.test.TestCase):
                 'stddev': 0.01,
             },
             'l2_regularization_scale': 0.0005,
+            'l1_sigma': 3.0,
             'activation_function': 'relu6',
             'proposals': {
                 'pre_nms_top_n': 12000,
@@ -38,6 +42,8 @@ class RPNTest(tf.test.TestCase):
                 'min_size': 0,
                 'clip_after_nms': False,
                 'filter_outside_anchors': False,
+                'apply_nms': True,
+                'min_prob_threshold': 0.0,
             },
             'target': {
                 'allowed_border': 0,

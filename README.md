@@ -7,36 +7,25 @@
 
 Luminoth is an open source toolkit for **computer vision**. Currently, we support object detection and image classification, but we are aiming for much more. It is built in Python, using [TensorFlow](https://www.tensorflow.org/) and [Sonnet](https://github.com/deepmind/sonnet).
 
-![Example of Object Detection](https://luminoth.ai/images/screen.png?v=1)
+![Example of Object Detection with Faster R-CNN](https://user-images.githubusercontent.com/1590959/36434494-e509be42-163d-11e8-99c1-d1aa728929ec.jpg)
 
 > **DISCLAIMER**: Luminoth is still alpha-quality release, which means the internal and external interfaces (such as command line) are very likely to change as the codebase matures.
 
 # Installation
 Luminoth currently supports Python 2.7 and 3.4–3.6.
 
-If [TensorFlow](https://www.tensorflow.org) and [Sonnet](https://github.com/deepmind/sonnet) are already installed, Luminoth will use those versions.
+## Pre-requisites
+If you want **GPU support**, you should install the GPU version of [TensorFlow](https://www.tensorflow.org/install/).
+If TensorFlow is is already installed, Luminoth will use that version (no matter if CPU or GPU versions).
 
-## Install with CPU support
-Just run:
+## Installing Luminoth
+Just install from PyPI:
+
 ```bash
 $ pip install luminoth
 ```
 
-This will install the CPU versions of TensorFlow & Sonnet if you don't have them.
-
-## Install with GPU support
-
-1. [Install TensorFlow](https://www.tensorflow.org/install/) with GPU support.
-2. [Install Sonnet](https://github.com/deepmind/sonnet#installation) with GPU support:
-    ```bash
-    $ pip install dm-sonnet-gpu
-    ```
-3. Install Luminoth from PyPI:
-    ```bash
-    $ pip install luminoth
-    ```
-
-## Install from source
+## Installing from source
 
 First, clone the repo on your machine and then install with `pip`:
 
@@ -93,5 +82,5 @@ tensorboard --logdir path/to/jobs
 >
 
 # License
-Copyright © 2017, [Tryolabs](https://tryolabs.com).
+Copyright © 2018, [Tryolabs](https://tryolabs.com).
 Released under the [BSD 3-Clause](LICENSE).

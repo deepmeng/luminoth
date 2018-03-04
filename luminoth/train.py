@@ -1,32 +1,30 @@
-import os
-
 import click
 import json
+import os
+import sys
 import tensorflow as tf
 import time
 
 from tensorflow.python import debug as tf_debug
 
-from luminoth.datasets.datasets import get_dataset
+from luminoth.datasets import get_dataset
+from luminoth.datasets.exceptions import InvalidDataDirectory
 from luminoth.models import get_model
-from luminoth.utils.config import get_model_config
-from luminoth.utils.hooks import ImageVisHook
-from luminoth.utils.training import (
-    get_optimizer, clip_gradients_by_norm
-)
+from luminoth.utils.config import get_config
+from luminoth.utils.hooks import ImageVisHook, VarVisHook
+from luminoth.utils.training import get_optimizer, clip_gradients_by_norm
+from luminoth.utils.experiments import save_run
 
 
-def run(model_type, dataset_type, config_file, override_params, target='',
-        cluster_spec=None, is_chief=True, job_name=None, task_index=None,
-        get_dataset_fn=get_dataset, get_model_fn=get_model, **kwargs):
+def run(config, target='', cluster_spec=None, is_chief=True, job_name=None,
+        task_index=None, get_model_fn=get_model, get_dataset_fn=get_dataset,
+        environment=None):
+    model_class = get_model_fn(config.model.type)
 
-    model_class = get_model_fn(model_type)
+    image_vis = config.train.get('image_vis')
+    var_vis = config.train.get('var_vis')
 
-    config = get_model_config(
-        model_class.base_config, config_file, override_params, **kwargs
-    )
-
-    if config.train.seed is not None:
+    if config.train.get('seed') is not None:
         tf.set_random_seed(config.train.seed)
 
     log_prefix = '[{}-{}] - '.format(job_name, task_index) \
@@ -46,26 +44,29 @@ def run(model_type, dataset_type, config_file, override_params, target='',
     # See:
     # https://www.tensorflow.org/api_docs/python/tf/train/replica_device_setter
     with tf.device(tf.train.replica_device_setter(cluster=cluster_spec)):
+        try:
+            config['dataset']['type']
+        except KeyError:
+            raise KeyError('dataset.type should be set on the custom config.')
 
-        dataset_class = get_dataset_fn(dataset_type)
-        dataset = dataset_class(config)
-        train_dataset = dataset()
+        try:
+            dataset_class = get_dataset_fn(config.dataset.type)
+            dataset = dataset_class(config)
+            train_dataset = dataset()
+        except InvalidDataDirectory as exc:
+            tf.logging.error(
+                "Error while reading dataset, {}".format(exc)
+            )
+            sys.exit(1)
 
         train_image = train_dataset['image']
         train_filename = train_dataset['filename']
         train_bboxes = train_dataset['bboxes']
 
-        # TODO: This is not the best place to configure rank? Why is rank not
-        # transmitted through the queue
-        train_image.set_shape((None, None, 3))
-        # We add fake batch dimension to train data.
-        # TODO: DEFINITELY NOT THE BEST PLACE
-        train_image = tf.expand_dims(train_image, 0)
-
         prediction_dict = model(train_image, train_bboxes, is_training=True)
         total_loss = model.loss(prediction_dict)
 
-        global_step = tf.contrib.framework.get_or_create_global_step()
+        global_step = tf.train.get_or_create_global_step()
 
         optimizer = get_optimizer(config.train, global_step)
 
@@ -77,12 +78,15 @@ def run(model_type, dataset_type, config_file, override_params, target='',
                 total_loss, trainable_vars
             )
 
-            # Clip by norm. TODO: Configurable
-            grads_and_vars = clip_gradients_by_norm(grads_and_vars)
+            # Clip by norm.
+            if config.train.clip_by_norm:
+                grads_and_vars = clip_gradients_by_norm(grads_and_vars)
 
-        train_op = optimizer.apply_gradients(
-            grads_and_vars, global_step=global_step
-        )
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+            train_op = optimizer.apply_gradients(
+                grads_and_vars, global_step=global_step
+            )
 
     tf.logging.info('{}Starting training for {}'.format(log_prefix, model))
 
@@ -103,15 +107,18 @@ def run(model_type, dataset_type, config_file, override_params, target='',
 
     # Create custom Scaffold to make sure we run our own init_op when model
     # is not restored from checkpoint.
+    summary_op = [model.summary]
+    summaries = tf.summary.merge_all()
+    if summaries is not None:
+        summary_op.append(summaries)
+    summary_op = tf.summary.merge(summary_op)
+
     scaffold = tf.train.Scaffold(
         # Initialize local and global variables.
         init_op=init_op,
         # Queue-related variables need a special initializer.
         local_init_op=tf.local_variables_initializer(),
-        summary_op=tf.summary.merge([
-            tf.summary.merge_all(),
-            model.summary,
-        ])
+        summary_op=summary_op,
     )
 
     # Custom hooks for our session
@@ -129,6 +136,7 @@ def run(model_type, dataset_type, config_file, override_params, target='',
         tf.logging.warning(
             '`job_dir` is not defined. Checkpoints and logs will not be saved.'
         )
+        checkpoint_dir = None
     elif config.train.run_name:
         # Use run_name when available
         checkpoint_dir = os.path.join(
@@ -137,20 +145,42 @@ def run(model_type, dataset_type, config_file, override_params, target='',
     else:
         checkpoint_dir = config.train.job_dir
 
-    if config.train.display_every_steps or config.train.display_every_secs:
-        if not config.train.debug:
+    should_add_hooks = (
+        config.train.display_every_steps
+        or config.train.display_every_secs
+        and checkpoint_dir is not None
+    )
+    if should_add_hooks:
+        if not config.train.debug and image_vis == 'debug':
             tf.logging.warning('ImageVisHook will not run without debug mode.')
-        else:
+        elif image_vis is not None:
             # ImageVis only runs on the chief.
             chief_only_hooks.append(
                 ImageVisHook(
-                    prediction_dict, with_rcnn=config.network.with_rcnn,
+                    prediction_dict,
+                    image=train_dataset['image'],
+                    gt_bboxes=train_dataset['bboxes'],
+                    with_rcnn=config.model.network.with_rcnn,
                     output_dir=checkpoint_dir,
                     every_n_steps=config.train.display_every_steps,
-                    every_n_secs=config.train.display_every_secs
+                    every_n_secs=config.train.display_every_secs,
+                    image_visualization_mode=image_vis
                 )
             )
 
+        if var_vis is not None:
+            # VarVis only runs on the chief.
+            chief_only_hooks.append(
+                VarVisHook(
+                    every_n_steps=config.train.display_every_steps,
+                    every_n_secs=config.train.display_every_secs,
+                    mode=var_vis,
+                    output_dir=checkpoint_dir,
+                    vars_summary=model.vars_summary,
+                )
+            )
+
+    step = -1
     with tf.train.MonitoredTrainingSession(
         master=target,
         is_chief=is_chief,
@@ -181,6 +211,11 @@ def run(model_type, dataset_type, config_file, override_params, target='',
                         time.time() - before
                     ))
 
+                if is_chief and step == 1:
+                    # We save the run after first batch to make sure everything
+                    # works properly.
+                    save_run(config, environment=environment)
+
         except tf.errors.OutOfRangeError:
             tf.logging.info(
                 '{}finished training after {} epoch limit'.format(
@@ -195,30 +230,20 @@ def run(model_type, dataset_type, config_file, override_params, target='',
         # Wait for all threads to stop.
         coord.join(threads)
 
+        return step
+
 
 @click.command(help='Train models')
-@click.option('model_type', '--model', required=True, default='fasterrcnn')  # noqa
-@click.option('dataset_type', '--dataset', required=True, default='tfrecord')  # noqa
-@click.option('config_file', '--config', '-c', help='Config to use.')
+@click.option('config_files', '--config', '-c', required=True, multiple=True, help='Config to use.')  # noqa
+@click.option('--job-dir', help='Job directory.')
 @click.option('override_params', '--override', '-o', multiple=True, help='Override model config params.')  # noqa
-@click.option('--seed', type=float, help='Global seed value for random operations.')  # noqa
-@click.option('--checkpoint-file', help='Weight checkpoint to resuming training from.')  # noqa
-@click.option('--ignore-scope', help='Used to ignore variables when loading from checkpoint.')  # noqa
-@click.option('--tf-debug', is_flag=True, help='Create debugging Tensorflow session with tfdb.')  # noqa
-@click.option('--debug', is_flag=True, help='Debug mode (DEBUG log level and intermediate variables are returned)')  # noqa
-@click.option('--run-name', type=str, help='Run name used to log in Tensorboard and isolate checkpoints.')  # noqa
-@click.option('--no-log/--log', default=False, help='Save or don\'t summary logs.')  # noqa
-@click.option('--random-shuffle/--fifo', default=True, help='Ingest data from dataset in random order.')  # noqa
-@click.option('--save-timeline', is_flag=True, help='Save timeline of execution (debug mode must be activated).')  # noqa
-@click.option('--full-trace', is_flag=True, help='Run graph session with FULL_TRACE config (for memory and running time debugging)')  # noqa
-@click.option('--job-dir', type=str, help='Directory where to save logs and checkpoints from training.')  # noqa
-def train(*args, **kwargs):
+def train(config_files, job_dir, override_params):
     """
     Parse TF_CONFIG to cluster_spec and call run() function
     """
-    # TF_CONFIG environment variable is available when running using
-    # gcloud either locally or on cloud. It has all the information required
-    # to create a ClusterSpec which is important for running distributed code.
+    # TF_CONFIG environment variable is available when running using gcloud
+    # either locally or on cloud. It has all the information required to create
+    # a ClusterSpec which is important for running distributed code.
     tf_config_val = os.environ.get('TF_CONFIG')
 
     if tf_config_val:
@@ -229,10 +254,23 @@ def train(*args, **kwargs):
     cluster = tf_config.get('cluster')
     job_name = tf_config.get('task', {}).get('type')
     task_index = tf_config.get('task', {}).get('index')
+    environment = tf_config.get('environment', 'local')
+
+    # Get the user config and the model type from it.
+    try:
+        config = get_config(config_files, override_params=override_params)
+    except KeyError:
+        # Without mode type defined we can't use the default config settings.
+        raise KeyError('model.type should be set on the custom config.')
+
+    if job_dir:
+        override_params += ('train.job_dir={}'.format(job_dir), )
 
     # If cluster information is empty or TF_CONFIG is not available, run local
     if job_name is None or task_index is None:
-        return run(*args, **kwargs)
+        return run(
+            config, environment=environment
+        )
 
     cluster_spec = tf.train.ClusterSpec(cluster)
     server = tf.train.Server(
@@ -247,10 +285,9 @@ def train(*args, **kwargs):
     elif job_name in ['master', 'worker']:
         is_chief = job_name == 'master'
         return run(
-            *args,
-            target=server.target, cluster_spec=cluster_spec,
+            config, target=server.target, cluster_spec=cluster_spec,
             is_chief=is_chief, job_name=job_name, task_index=task_index,
-            **kwargs
+            environment=environment
         )
 
 

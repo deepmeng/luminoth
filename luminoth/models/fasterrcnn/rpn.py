@@ -20,12 +20,17 @@ class RPN(snt.AbstractModule):
 
     def __init__(self, num_anchors, config, debug=False, seed=None,
                  name='rpn'):
-        """RPN - Region Proposal Network
+        """RPN - Region Proposal Network.
 
-        This module works almost independently from the Faster RCNN module.
-        It instantiates its own submodules and calculates its own loss,
-        and can be used on its own.
+        Given an image (as feature map) and a fixed set of anchors, the RPN
+        will learn weights to adjust those anchors so they better look like the
+        ground truth objects, as well as scoring them by "objectness" (ie. how
+        likely they are to be an object vs background).
 
+        The final result will be a set of rectangular boxes ("proposals"),
+        each associated with an objectness score.
+
+        Note: this module can be used independently of Faster R-CNN.
         """
         super(RPN, self).__init__(name=name)
         self._num_anchors = num_anchors
@@ -50,8 +55,9 @@ class RPN(snt.AbstractModule):
             scale=config.l2_regularization_scale
         )
 
-        # We could use normal relu without any problems.
+        self._l1_sigma = config.l1_sigma
 
+        # We could use normal relu without any problems.
         self._rpn_activation = get_activation_function(
             config.activation_function
         )
@@ -84,7 +90,7 @@ class RPN(snt.AbstractModule):
         )
 
     def _build(self, conv_feature_map, im_shape, all_anchors,
-               gt_boxes=None):
+               gt_boxes=None, is_training=False):
         """Builds the RPN model subgraph.
 
         Args:
@@ -104,9 +110,9 @@ class RPN(snt.AbstractModule):
 
         Returns:
             prediction_dict: A dict with the following keys:
-                proposals: A Tensor with an unknown number of proposals for
+                proposals: A Tensor with a variable number of proposals for
                     objects on the image.
-                scores: A Tensor with a objectivness probability for each
+                scores: A Tensor with a "objectness" probability for each
                     proposal. The score should be the output of the softmax for
                     object.
 
@@ -139,7 +145,8 @@ class RPN(snt.AbstractModule):
 
         # Get the RPN feature using a simple conv net. Activation function
         # can be set to empty.
-        rpn_feature = self._rpn_activation(self._rpn(conv_feature_map))
+        rpn_conv_feature = self._rpn(conv_feature_map)
+        rpn_feature = self._rpn_activation(rpn_conv_feature)
 
         # Then we apply separate conv layers for classification and regression.
         rpn_cls_score_original = self._rpn_cls(rpn_feature)
@@ -169,8 +176,8 @@ class RPN(snt.AbstractModule):
         proposal_prediction = self._proposal(
             rpn_cls_prob, rpn_bbox_pred, all_anchors, im_shape)
 
-        prediction_dict['proposals'] = proposal_prediction['nms_proposals']
-        prediction_dict['scores'] = proposal_prediction['nms_proposals_scores']
+        prediction_dict['proposals'] = proposal_prediction['proposals']
+        prediction_dict['scores'] = proposal_prediction['scores']
 
         if self._debug:
             prediction_dict['proposal_prediction'] = proposal_prediction
@@ -188,24 +195,24 @@ class RPN(snt.AbstractModule):
 
             if self._debug:
                 prediction_dict['rpn_max_overlap'] = rpn_max_overlap
-
-            variable_summaries(rpn_bbox_target, 'rpn_bbox_target', ['rpn'])
+                variable_summaries(rpn_bbox_target, 'rpn_bbox_target', 'full')
 
         # Variables summaries.
-        variable_summaries(
-            proposal_prediction['nms_proposals_scores'], 'rpn_scores', ['rpn'])
-        variable_summaries(rpn_cls_prob, 'rpn_cls_prob', ['rpn'])
-        variable_summaries(rpn_bbox_pred, 'rpn_bbox_pred', ['rpn'])
-        variable_summaries(rpn_feature, 'rpn_feature', ['rpn'])
-        variable_summaries(
-            rpn_cls_score_original, 'rpn_cls_score_original', ['rpn'])
-        variable_summaries(
-            rpn_bbox_pred_original, 'rpn_bbox_pred_original', ['rpn'])
+        variable_summaries(prediction_dict['scores'], 'rpn_scores', 'reduced')
+        variable_summaries(rpn_cls_prob, 'rpn_cls_prob', 'reduced')
+        variable_summaries(rpn_bbox_pred, 'rpn_bbox_pred', 'reduced')
 
-        # Layer summaries.
-        layer_summaries(self._rpn, ['rpn'])
-        layer_summaries(self._rpn_cls, ['rpn'])
-        layer_summaries(self._rpn_bbox, ['rpn'])
+        if self._debug:
+            variable_summaries(rpn_feature, 'rpn_feature', 'full')
+            variable_summaries(
+               rpn_cls_score_original, 'rpn_cls_score_original', 'full')
+            variable_summaries(
+               rpn_bbox_pred_original, 'rpn_bbox_pred_original', 'full')
+
+            # Layer summaries.
+            layer_summaries(self._rpn, 'full')
+            layer_summaries(self._rpn_cls, 'full')
+            layer_summaries(self._rpn_bbox, 'full')
 
         return prediction_dict
 
@@ -220,7 +227,7 @@ class RPN(snt.AbstractModule):
                 * 1: for positive labels
                 * 0: for negative labels
                 * -1: for labels we should ignore.
-                Shape: (num_anchors, 4)
+                Shape: (num_anchors, )
             rpn_bbox_target: Bounding box output delta target for rpn.
                 Shape: (num_anchors, 4)
             rpn_bbox_pred: Bounding box output delta prediction for rpn.
@@ -272,7 +279,7 @@ class RPN(snt.AbstractModule):
 
             # We apply smooth l1 loss as described by the Fast R-CNN paper.
             reg_loss_per_anchor = smooth_l1_loss(
-                rpn_bbox_pred, rpn_bbox_target
+                rpn_bbox_pred, rpn_bbox_target, sigma=self._l1_sigma
             )
 
             prediction_dict['reg_loss_per_anchor'] = reg_loss_per_anchor
@@ -297,6 +304,6 @@ class RPN(snt.AbstractModule):
                 'foreground_samples', tf.shape(rpn_bbox_target)[0], ['rpn'])
 
             return {
-                'rpn_cls_loss': tf.reduce_sum(ce_per_anchor),
-                'rpn_reg_loss': tf.reduce_sum(reg_loss_per_anchor),
+                'rpn_cls_loss': tf.reduce_mean(ce_per_anchor),
+                'rpn_reg_loss': tf.reduce_mean(reg_loss_per_anchor),
             }

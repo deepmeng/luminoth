@@ -11,19 +11,25 @@ For this purpose, Luminoth provides the `lumi dataset transform` command, which 
 - [Pascal VOC2012](http://host.robots.ox.ac.uk:8080/pascal/VOC/voc2012/index.html)
 
 ```
-$ lumi dataset transform --type pascalvoc --data-dir ~/dataset/pascalvoc/ --output-dir ~/dataset/pascalvoc/tf/
+$ lumi dataset transform --type pascal --data-dir ~/dataset/pascal/ --output-dir ~/dataset/pascal/tf/ --split train --split val
 ```
 
 - [ImageNet](http://image-net.org/download)
 
 ```
-$ lumi dataset transform --type imagenet --data-dir ~/dataset/imagenet/ --output-dir ~/dataset/imagenet/tf/
+$ lumi dataset transform --type imagenet --data-dir ~/dataset/imagenet/ --output-dir ~/dataset/imagenet/tf/ --split train --split val
+```
+
+- [COCO](http://cocodataset.org/#download)
+
+```
+$ lumi dataset transform --type coco --data-dir ~/dataset/coco/ --output-dir ~/dataset/coco/tf --split train --split val
 ```
 
 ## Limiting the dataset
 During development, it is often useful to verify that the model can actually overfit a small dataset.
 
-You can use the `--limit-examples and `--limit-classes` options for this.
+You can use the `--limit-examples` and `--limit-classes` options for this.
 
 For more information, try `lumi dataset transform --help`.
 

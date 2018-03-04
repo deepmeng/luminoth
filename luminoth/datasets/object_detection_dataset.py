@@ -1,9 +1,10 @@
-import sonnet as snt
 import tensorflow as tf
 
+from luminoth.datasets.base_dataset import BaseDataset
 from luminoth.utils.image import (
     resize_image, flip_image, random_patch, random_resize, random_distortion
 )
+
 DATA_AUGMENTATION_STRATEGIES = {
     'flip': flip_image,
     'patch': random_patch,
@@ -12,14 +13,14 @@ DATA_AUGMENTATION_STRATEGIES = {
 }
 
 
-class ObjectDetectionDataset(snt.AbstractModule):
+class ObjectDetectionDataset(BaseDataset):
     """Abstract object detector dataset module.
 
     This module implements some of the basic functionalities every object
     detector dataset usually needs.
 
-    Object detection datasets, are datasets that have ground-truth information
-    consisting of bounding boxes.
+    Object detection datasets are datasets that have ground-truth information
+    consisting of rectangular bounding boxes.
 
     Attributes:
         dataset_dir (str): Base directory of the dataset.
@@ -33,29 +34,107 @@ class ObjectDetectionDataset(snt.AbstractModule):
         random_shuffle (bool): To consume the dataset using random shuffle or
             to just use a regular FIFO queue.
     """
-    def __init__(self, config, **kwargs):
+
+    CONTEXT_FEATURES = {
+        'image_raw': tf.FixedLenFeature([], tf.string),
+        'filename': tf.FixedLenFeature([], tf.string),
+        'width': tf.FixedLenFeature([], tf.int64),
+        'height': tf.FixedLenFeature([], tf.int64),
+        'depth': tf.FixedLenFeature([], tf.int64),
+    }
+
+    SEQUENCE_FEATURES = {
+        'label': tf.VarLenFeature(tf.int64),
+        'xmin': tf.VarLenFeature(tf.int64),
+        'xmax': tf.VarLenFeature(tf.int64),
+        'ymin': tf.VarLenFeature(tf.int64),
+        'ymax': tf.VarLenFeature(tf.int64),
+    }
+
+    def __init__(self, config, name='object_detection_dataset', **kwargs):
         """
         Save general purpose attributes for Dataset module.
 
         Args:
             config: Config object with all the session properties.
         """
-        super(ObjectDetectionDataset, self).__init__(**kwargs)
-        self._dataset_dir = config.dataset.dir
-        self._num_epochs = config.train.num_epochs
-        self._batch_size = config.train.batch_size
-        self._split = config.dataset.split
+        super(ObjectDetectionDataset, self).__init__(config, **kwargs)
         self._image_min_size = config.dataset.image_preprocessing.min_size
         self._image_max_size = config.dataset.image_preprocessing.max_size
-        self._random_shuffle = config.train.random_shuffle
         # In case no keys are defined, default to empty list.
         self._data_augmentation = config.dataset.data_augmentation or []
-        self._seed = config.train.seed
 
-    def _build():
-        pass
+    def preprocess(self, image, bboxes=None):
+        """Apply transformations to image and bboxes (if available).
 
-    def _augment(self, image, bboxes, default_prob=0.5):
+        Transformations are applied according to the config values.
+        """
+        # Resize images (if needed)
+        image, bboxes, scale_factor = self._resize_image(image, bboxes)
+        image, bboxes, applied_augmentations = self._augment(image, bboxes)
+
+        return image, bboxes, {
+            'scale_factor': scale_factor,
+            'applied_augmentations': applied_augmentations,
+        }
+
+    def read_record(self, record):
+        """Parse record TFRecord into a set a set of values, names and types
+        that can be queued and then read.
+
+        Returns:
+            - queue_values: Dict with tensor values.
+            - queue_names: Names for each tensor.
+            - queue_types: Types for each tensor.
+        """
+        # We parse variable length features (bboxes in a image) as sequence
+        # features
+        context_example, sequence_example = tf.parse_single_sequence_example(
+            record,
+            context_features=self.CONTEXT_FEATURES,
+            sequence_features=self.SEQUENCE_FEATURES
+        )
+
+        # Decode image
+        image_raw = tf.image.decode_image(
+            context_example['image_raw'], channels=3
+        )
+
+        image = tf.cast(image_raw, tf.float32)
+
+        height = tf.cast(context_example['height'], tf.int32)
+        width = tf.cast(context_example['width'], tf.int32)
+        image_shape = tf.stack([height, width, 3])
+        image = tf.reshape(image, image_shape)
+
+        label = self._sparse_to_tensor(sequence_example['label'])
+        xmin = self._sparse_to_tensor(sequence_example['xmin'])
+        xmax = self._sparse_to_tensor(sequence_example['xmax'])
+        ymin = self._sparse_to_tensor(sequence_example['ymin'])
+        ymax = self._sparse_to_tensor(sequence_example['ymax'])
+
+        # Stack parsed tensors to define bounding boxes of shape (num_boxes, 5)
+        bboxes = tf.stack([xmin, ymin, xmax, ymax, label], axis=1)
+
+        image, bboxes, preprocessing_details = self.preprocess(image, bboxes)
+
+        filename = tf.cast(context_example['filename'], tf.string)
+
+        # TODO: Send additional metadata through the queue (scale_factor,
+        # applied_augmentations)
+
+        queue_dtypes = [tf.float32, tf.int32, tf.string, tf.float32]
+        queue_names = ['image', 'bboxes', 'filename', 'scale_factor']
+        queue_values = {
+            'image': image,
+            'bboxes': bboxes,
+            'filename': filename,
+            'scale_factor': preprocessing_details['scale_factor'],
+        }
+
+        return queue_values, queue_dtypes, queue_names
+
+    def _augment(self, image, bboxes=None, default_prob=0.5):
         """Applies different data augmentation techniques.
 
         Uses the list of data augmentation configurations, each data
@@ -97,19 +176,26 @@ class ObjectDetectionDataset(snt.AbstractModule):
             prob = tf.to_float(aug_config.pop('prob', default_prob))
             apply_aug_strategy = tf.less(random_number, prob)
 
-            augmented = tf.cond(
+            augmented = aug_fn(image, bboxes, **aug_config)
+
+            image = tf.cond(
                 apply_aug_strategy,
-                lambda: aug_fn(image, bboxes, **aug_config),
-                lambda: {'image': image, 'bboxes': bboxes}
+                lambda: augmented['image'],
+                lambda: image
             )
-            image = augmented['image']
-            bboxes = augmented.get('bboxes')
+
+            if bboxes is not None:
+                bboxes = tf.cond(
+                    apply_aug_strategy,
+                    lambda: augmented.get('bboxes'),
+                    lambda: bboxes
+                )
 
             applied_data_augmentation.append({aug_type: apply_aug_strategy})
 
         return image, bboxes, applied_data_augmentation
 
-    def _resize_image(self, image, bboxes):
+    def _resize_image(self, image, bboxes=None):
         """
         We need to resize image and bounding boxes when the biggest side
         dimension is bigger than `self._image_max_size` or when the smaller
@@ -135,4 +221,9 @@ class ObjectDetectionDataset(snt.AbstractModule):
             max_size=self._image_max_size
         )
 
-        return resized['image'], resized['bboxes'], resized['scale_factor']
+        return resized['image'], resized.get('bboxes'), resized['scale_factor']
+
+    def _sparse_to_tensor(self, sparse_tensor, dtype=tf.int32, axis=[1]):
+        return tf.squeeze(
+            tf.cast(tf.sparse_tensor_to_dense(sparse_tensor), dtype), axis=axis
+        )

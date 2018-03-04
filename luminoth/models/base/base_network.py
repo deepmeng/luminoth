@@ -1,13 +1,13 @@
-import sonnet as snt
-import tensorflow as tf
 import functools
 
-from tensorflow.contrib.slim.nets import (
-    vgg, resnet_v2, resnet_v1
-)
+import sonnet as snt
+import tensorflow as tf
 import tensorflow.contrib.slim as slim
 
+from tensorflow.contrib.slim.nets import vgg, resnet_v2, resnet_v1
+
 from luminoth.utils.checkpoint_downloader import get_checkpoint_file
+
 
 # Default RGB means used commonly.
 _R_MEAN = 123.68
@@ -27,10 +27,18 @@ VALID_ARCHITECTURES = set([
 
 
 class BaseNetwork(snt.AbstractModule):
+    """
+    Convolutional Neural Network used for image classification, whose
+    architecture can be any of the `VALID_ARCHITECTURES`.
+
+    This class wraps the `tf.slim` implementations of these models, with some
+    helpful additions.
+    """
+
     def __init__(self, config, name='base_network'):
         super(BaseNetwork, self).__init__(name=name)
         if config.get('architecture') not in VALID_ARCHITECTURES:
-            raise ValueError('Invalid architecture "{}"'.format(
+            raise ValueError('Invalid architecture: "{}"'.format(
                 config.get('architecture')
             ))
 
@@ -43,11 +51,16 @@ class BaseNetwork(snt.AbstractModule):
 
         if self.vgg_type:
             return vgg.vgg_arg_scope(**arg_scope_kwargs)
-        elif self.resnet_type:
-            # It's the same argscope for v1 or v2.
+
+        if self.resnet_type:
+            # It's the same arg_scope for v1 or v2.
             return resnet_v2.resnet_utils.resnet_arg_scope(**arg_scope_kwargs)
 
-    def network(self, is_training=True):
+        raise ValueError('Invalid architecture: "{}"'.format(
+            self._config.get('architecture')
+        ))
+
+    def network(self, is_training=False):
         if self.vgg_type:
             return functools.partial(
                 getattr(vgg, self._architecture),
@@ -55,16 +68,24 @@ class BaseNetwork(snt.AbstractModule):
                 spatial_squeeze=self._config.get('spatial_squeeze', False)
             )
         elif self.resnet_v1_type:
+            output_stride = self._config.get('output_stride')
+            train_batch_norm = (
+                is_training and self._config.get('train_batch_norm')
+            )
             return functools.partial(
                 getattr(resnet_v1, self._architecture),
-                is_training=is_training,
-                num_classes=self._config.get('num_classes')
+                is_training=train_batch_norm,
+                num_classes=None,
+                global_pool=False,
+                output_stride=output_stride
             )
         elif self.resnet_v2_type:
+            output_stride = self._config.get('output_stride')
             return functools.partial(
                 getattr(resnet_v2, self._architecture),
                 is_training=is_training,
-                num_classes=self._config.get('num_classes')
+                num_classes=self._config.get('num_classes'),
+                output_stride=output_stride,
             )
 
     @property
@@ -83,7 +104,17 @@ class BaseNetwork(snt.AbstractModule):
     def resnet_v2_type(self):
         return self._architecture.startswith('resnet_v2')
 
-    def _build(self, inputs, is_training=True):
+    @property
+    def default_image_size(self):
+        # Usually 224, but depends on the architecture.
+        if self.vgg_type:
+            return vgg.vgg_16.default_image_size
+        if self.resnet_v1_type:
+            return resnet_v1.resnet_v1.default_image_size
+        if self.resnet_v2_type:
+            return resnet_v2.resnet_v2.default_image_size
+
+    def _build(self, inputs, is_training=False):
         inputs = self.preprocess(inputs)
         with slim.arg_scope(self.arg_scope):
             net, end_points = self.network(is_training=is_training)(inputs)
@@ -95,23 +126,23 @@ class BaseNetwork(snt.AbstractModule):
 
     def preprocess(self, inputs):
         if self.vgg_type or self.resnet_type:
-            inputs = self._substract_channels(inputs)
+            inputs = self._subtract_channels(inputs)
 
         return inputs
 
-    def _substract_channels(self, inputs, means=[_R_MEAN, _G_MEAN, _B_MEAN]):
-        """Substract channels from images.
+    def _subtract_channels(self, inputs, means=[_R_MEAN, _G_MEAN, _B_MEAN]):
+        """Subtract channels from images.
 
-        It is common for CNNs to substract the mean of all images from each
+        It is common for CNNs to subtract the mean of all images from each
         channel. In the case of RGB images we first calculate the mean from
-        each of the channels (Red, Green, Blue) and substract those values
+        each of the channels (Red, Green, Blue) and subtract those values
         for training and for inference.
 
         Args:
             inputs: A Tensor of images we want to normalize. Its shape is
                 (1, height, width, num_channels).
             means: A Tensor of shape (num_channels,) with the means to be
-                substracted from each channels on the inputs.
+                subtracted from each channels on the inputs.
 
         Returns:
             outputs: A Tensor of images normalized with the means.
@@ -135,7 +166,7 @@ class BaseNetwork(snt.AbstractModule):
 
     def load_weights(self):
         """
-        Creates operations to load weigths from checkpoint for each of the
+        Creates operations to load weights from checkpoint for each of the
         variables defined in the module. It is assumed that all variables
         of the module are included in the checkpoint but with a different
         prefix.
@@ -148,9 +179,10 @@ class BaseNetwork(snt.AbstractModule):
             return tf.no_op(name='not_loading_base_network')
 
         if self._config.get('weights') is None:
-            # Download the weights (or used cached) if is is not specified in
+            # Download the weights (or used cached) if not specified in the
             # config file.
-            # Weights are downloaded by default on the ~/.luminoth folder.
+            # Weights are downloaded by default to the $LUMI_HOME folder if
+            # running locally, or to the job bucket if running in Google Cloud.
             self._config['weights'] = get_checkpoint_file(self._architecture)
 
         module_variables = snt.get_variables_in_module(
@@ -181,30 +213,33 @@ class BaseNetwork(snt.AbstractModule):
         return load_op
 
     def get_trainable_vars(self):
-        """Get trainable vars for the network.
+        """
+        Returns a list of the variables that are trainable.
 
-        Not all variables are trainable, it depends on the endpoint being used.
-        For example, when using a Pretrained network for object detection we
-        don't want to define variables below the selected endpoint to be
+        If a value for `fine_tune_from` is specified in the config, only the
+        variables starting from the first that contains this string in its name
+        will be trainable. For example, specifying `vgg_16/fc6` for a VGG16
+        will set only the variables in the fully connected layers to be
         trainable.
-
-        It is also possible to partially train part of the CNN, for that case
-        we use config's `finetune_num_layers` variable to define how many
-        layers from the chosen endpoint we want to train.
+        If `fine_tune_from` is None, then all the variables will be trainable.
 
         Returns:
-            trainable_variables: A list of variables.
+            trainable_variables: a tuple of `tf.Variable`.
         """
         all_variables = snt.get_variables_in_module(self)
-        var_names = [v.name for v in all_variables]
-        last_idx = [
-            i for i, name in enumerate(var_names) if self._endpoint in name
-        ][0]
 
-        finetune_num_layers = self._config.get('finetune_num_layers')
-        if not finetune_num_layers:
+        fine_tune_from = self._config.get('fine_tune_from')
+        if fine_tune_from is None:
             return all_variables
-        else:
-            return all_variables[
-                last_idx - finetune_num_layers * 2:last_idx
-            ]
+
+        # Get the index of the first trainable variable
+        var_iter = enumerate(v.name for v in all_variables)
+        try:
+            index = next(i for i, name in var_iter if fine_tune_from in name)
+        except StopIteration:
+            raise ValueError(
+                '"{}" is an invalid value of fine_tune_from for this '
+                'architecture.'.format(fine_tune_from)
+            )
+
+        return all_variables[index:]

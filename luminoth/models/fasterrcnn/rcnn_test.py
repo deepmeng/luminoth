@@ -5,6 +5,12 @@ from easydict import EasyDict
 from luminoth.models.fasterrcnn.rcnn import RCNN
 
 
+class MockBaseNetwork():
+
+    def _build_tail(self, features, **kargs):
+        return features
+
+
 class RCNNTest(tf.test.TestCase):
     def setUp(self):
         tf.reset_default_graph()
@@ -22,16 +28,29 @@ class RCNNTest(tf.test.TestCase):
         self._config = EasyDict({
             'enabled': True,
             'layer_sizes': [4096, 4096],
-            'dropout_keep_prop': 1.0,
+            'dropout_keep_prob': 1.0,
             'activation_function': 'relu6',
             'use_mean': False,
-            'initializer': {
+            'rcnn_initializer': {
+                'type': 'variance_scaling_initializer',
+                'factor': 1.0,
+                'uniform': True,
+                'mode': 'FAN_AVG',
+            },
+            'bbox_initializer': {
+                'type': 'variance_scaling_initializer',
+                'factor': 1.0,
+                'uniform': True,
+                'mode': 'FAN_AVG',
+            },
+            'cls_initializer': {
                 'type': 'variance_scaling_initializer',
                 'factor': 1.0,
                 'uniform': True,
                 'mode': 'FAN_AVG',
             },
             'l2_regularization_scale': 0.0005,
+            'l1_sigma': 3.0,
             'roi': {
                 'pooling_mode': 'crop',
                 'pooled_width': 7,
@@ -54,6 +73,7 @@ class RCNNTest(tf.test.TestCase):
 
         })
 
+        self._base_network = MockBaseNetwork()
         self._shared_model = RCNN(self._num_classes, self._config)
 
         # Declare placeholders
@@ -68,7 +88,7 @@ class RCNNTest(tf.test.TestCase):
             tf.float32, shape=self._pretrained_feature_map_shape
         )
 
-        self._proposals_shape = (self._num_proposals, 5)
+        self._proposals_shape = (self._num_proposals, 4)
         self._proposals_ph = tf.placeholder(
             tf.float32, shape=self._proposals_shape
         )
@@ -161,7 +181,7 @@ class RCNNTest(tf.test.TestCase):
         # Prediction session (not training)
         rcnn_net_not_training = self._shared_model(
             self._pretrained_feature_map_ph, self._proposals_ph,
-            self._image_shape_ph
+            self._image_shape_ph, self._base_network
         )
 
         prediction_dict_not_training = self._run_net_with_feed_dict(
@@ -181,7 +201,7 @@ class RCNNTest(tf.test.TestCase):
         # Training session
         rcnn_net_training = self._shared_model(
             self._pretrained_feature_map_ph, self._proposals_ph,
-            self._image_shape_ph, self._gt_boxes_ph
+            self._image_shape_ph, self._base_network, self._gt_boxes_ph
         )
         prediction_dict_training = self._run_net_with_feed_dict(
             rcnn_net_training,
@@ -216,7 +236,7 @@ class RCNNTest(tf.test.TestCase):
 
         rcnn_net = self._shared_model(
             self._pretrained_feature_map_ph, self._proposals_ph,
-            self._image_shape_ph, self._gt_boxes_ph
+            self._image_shape_ph, self._base_network, self._gt_boxes_ph
         )
 
         prediction_dict = self._run_net_with_feed_dict(
@@ -252,7 +272,7 @@ class RCNNTest(tf.test.TestCase):
 
         rcnn_net = self._shared_model(
             self._pretrained_feature_map_ph, self._proposals_ph,
-            self._image_shape_ph
+            self._image_shape_ph, self._base_network
         )
 
         prediction_dict = self._run_net_with_feed_dict(

@@ -1,103 +1,25 @@
 import click
-import json
-import time
-import numpy as np
 import tensorflow as tf
 
 from flask import Flask, jsonify, request, render_template
-from luminoth.models import get_model
+from threading import Thread
 from PIL import Image
 
-app = Flask(__name__)
+from luminoth.tools.checkpoint import get_checkpoint_config
+from luminoth.utils.config import get_config, override_config_params
+from luminoth.utils.predicting import PredictorNetwork
 
-LOADED_MODELS = {}
+
+app = Flask(__name__)
 
 
 def get_image():
     image = request.files.get('image')
     if not image:
-        return None
+        raise ValueError
 
-    image = Image.open(image.stream)
+    image = Image.open(image.stream).convert('RGB')
     return image
-
-
-def resize_image(image, min_size, max_size):
-    min_dimension = min(image.height, image.width)
-    upscale = max(min_size / min_dimension, 1.)
-
-    max_dimension = max(image.height, image.width)
-    downscale = min(max_size / max_dimension, 1.)
-
-    new_width = int(upscale * downscale * image.width)
-    new_height = int(upscale * downscale * image.height)
-
-    image = image.resize((new_width, new_height))
-    image_array = np.array(image)[:, :, :3]  # TODO Read RGB
-    image_array = np.expand_dims(image_array, axis=0)
-    return image_array, upscale * downscale
-
-
-def get_prediction(model_name, image, checkpoint_file=None, classes_file=None):
-
-    model_class = get_model(model_name)
-
-    if model_name in LOADED_MODELS:
-        image_tensor, output, graph, session = LOADED_MODELS[model_name]
-    else:
-        graph = tf.Graph()
-        session = tf.Session(graph=graph)
-
-        with graph.as_default():
-            image_tensor = tf.placeholder(tf.float32, (1, None, None, 3))
-            model = model_class(model_class.base_config)
-            output = model(image_tensor)
-            if checkpoint_file:
-                saver = tf.train.Saver(sharded=True, allow_empty=True)
-                saver.restore(session, checkpoint_file)
-            else:
-                init_op = tf.group(
-                    tf.global_variables_initializer(),
-                    tf.local_variables_initializer()
-                )
-                session.run(init_op)
-
-        LOADED_MODELS[model_name] = (image_tensor, output, graph, session)
-
-    classification_prediction = output['classification_prediction']
-    objects_tf = classification_prediction['objects']
-    objects_labels_tf = classification_prediction['labels']
-    objects_labels_prob_tf = classification_prediction['probs']
-    image_resize_config = model_class.base_config.dataset.image_preprocessing
-
-    image_array, scale_factor = resize_image(
-        image, float(image_resize_config.min_size),
-        float(image_resize_config.max_size)
-    )
-
-    start_time = time.time()
-    objects, objects_labels, objects_labels_prob = session.run([
-        objects_tf, objects_labels_tf, objects_labels_prob_tf
-    ], feed_dict={
-        image_tensor: image_array
-    })
-    end_time = time.time()
-
-    if classes_file:
-        # Gets the names of the classes
-        class_labels = json.load(tf.gfile.GFile(classes_file))
-        objects_labels = [class_labels[obj] for obj in objects_labels]
-
-    else:
-        objects_labels = objects_labels.tolist()
-
-    return {
-        'objects': objects.tolist(),
-        'objects_labels': objects_labels,
-        'objects_labels_prob': objects_labels_prob.tolist(),
-        'inference_time': end_time - start_time,
-        'scale_factor': scale_factor,
-    }
 
 
 @app.route('/')
@@ -108,24 +30,65 @@ def index():
 @app.route('/api/<model_name>/predict', methods=['GET', 'POST'])
 def predict(model_name):
     if request.method == 'GET':
-        return jsonify(error='Use POST method to send image.')
+        return jsonify(error='Use POST method to send image.'), 400
 
-    image_array = get_image()
-    if image_array is None:
-        return jsonify(error='Missing image.')
+    try:
+        image_array = get_image()
+    except ValueError:
+        return jsonify(error='Missing image'), 400
+    except OSError:
+        return jsonify(error='Incompatible file type'), 400
 
-    pred = get_prediction(
-        model_name, image_array, app.config['checkpoint_file'],
-        app.config['classes_file']
+    total_predictions = request.args.get('total')
+    if total_predictions is not None:
+        try:
+            total_predictions = int(total_predictions)
+        except ValueError:
+            total_predictions = None
+
+    NETWORK_START_THREAD.join()
+    prediction = PREDICTOR_NETWORK.predict_image(
+        image_array, total_predictions
     )
+    return jsonify(prediction)
 
-    return jsonify(pred)
+
+def start_network(config):
+    global PREDICTOR_NETWORK
+    PREDICTOR_NETWORK = PredictorNetwork(config)
 
 
 @click.command(help='Start basic web application.')
-@click.option('--checkpoint-file')
-@click.option('--classes-file')
-def web(checkpoint_file, classes_file):
-    app.config['checkpoint_file'] = checkpoint_file
-    app.config['classes_file'] = classes_file
-    app.run(debug=True)
+@click.option('config_files', '--config', '-c', multiple=True, help='Config to use.')  # noqa
+@click.option('--checkpoint', help='Checkpoint to use.')
+@click.option('override_params', '--override', '-o', multiple=True, help='Override model config params.')  # noqa
+@click.option('--host', default='127.0.0.1', help='Hostname to listen on. Set this to "0.0.0.0" to have the server available externally.')  # noqa
+@click.option('--port', default=5000, help='Port to listen to.')
+@click.option('--debug', is_flag=True, help='Set debug level logging.')
+def web(config_files, checkpoint, override_params, host, port, debug):
+    if debug:
+        tf.logging.set_verbosity(tf.logging.DEBUG)
+    else:
+        tf.logging.set_verbosity(tf.logging.INFO)
+
+    if checkpoint:
+        config = get_checkpoint_config(checkpoint)
+    elif config_files:
+        config = get_config(config_files)
+    else:
+        click.echo('You must specify either a checkpoint or a config file.')
+        return
+
+    if override_params:
+        config = override_config_params(config, override_params)
+
+    # Bounding boxes will be filtered by frontend (using slider), so we set a
+    # low threshold.
+    config.model.rcnn.proposals.min_prob_threshold = 0.01
+
+    # Initialize model
+    global NETWORK_START_THREAD
+    NETWORK_START_THREAD = Thread(target=start_network, args=(config,))
+    NETWORK_START_THREAD.start()
+
+    app.run(host=host, port=port, debug=debug)

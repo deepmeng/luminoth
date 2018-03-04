@@ -35,7 +35,7 @@ class RCNNProposal(snt.AbstractModule):
         # Max number of object detections per class.
         self._class_max_detections = config.class_max_detections
         # NMS intersection over union threshold to be used for classes.
-        self._class_nms_threshold = config.class_nms_threshold
+        self._class_nms_threshold = float(config.class_nms_threshold)
         # Maximum number of detections to return.
         self._total_max_detections = config.total_max_detections
         # Threshold probability
@@ -45,7 +45,7 @@ class RCNNProposal(snt.AbstractModule):
         """
         Args:
             proposals: Tensor with the RPN proposals bounding boxes.
-                Shape (num_proposals, 5). Where num_proposals is less than
+                Shape (num_proposals, 4). Where num_proposals is less than
                 POST_NMS_TOP_N (We don't know exactly beforehand)
             bbox_pred: Tensor with the RCNN delta predictions for each proposal
                 for each class. Shape (num_proposals, 4 * num_classes)
@@ -65,13 +65,8 @@ class RCNNProposal(snt.AbstractModule):
                 Shape (final_num_proposals,)
 
         """
-
-        # remove batch_id from proposals
-        with tf.control_dependencies([tf.equal(tf.shape(proposals)[-1], 5)]):
-            proposals = proposals[:, 1:]
-
         # First we want get the most probable label for each proposal
-        # We still have the background on idx 0 so we substract 1 to the idxs.
+        # We still have the background on idx 0 so we subtract 1 to the idxs.
         proposal_label = tf.argmax(cls_prob, axis=1) - 1
         # Get the probability for the selected label for each proposal.
         proposal_label_prob = tf.reduce_max(cls_prob, axis=1)
@@ -156,10 +151,13 @@ class RCNNProposal(snt.AbstractModule):
             total_objects - total_raw_objects, ['rcnn']
         )
 
-        tf.summary.scalar(
-            'valid_proposals_ratio',
+        valid_proposals_ratio = (
             tf.cast(total_proposals, tf.float32) /
-            tf.cast(total_objects, tf.float32), ['rcnn']
+            tf.cast(total_objects, tf.float32)
+        )
+
+        tf.summary.scalar(
+            'valid_proposals_ratio', valid_proposals_ratio, ['rcnn']
         )
 
         # We have to use the TensorFlow's bounding box convention to use the

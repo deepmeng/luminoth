@@ -56,24 +56,6 @@ def get_learning_rate(train_config, global_step=None):
         **lr_config
     )
 
-    # if decay_method == 'piecewise_constant':
-    #     learning_rate = tf.train.piecewise_constant(
-    #         global_step, boundaries=[
-    #             tf.cast(train_config.learning_rate_decay, tf.int64), ],
-    #         values=[
-    #             train_config.initial_learning_rate,
-    #             train_config.initial_learning_rate * 0.1
-    #         ], name='learning_rate_piecewise_constant'
-    #     )
-
-    # elif decay_method == 'exponential_decay':
-    #     learning_rate = tf.train.exponential_decay(
-    #         learning_rate=train_config.initial_learning_rate,
-    #         global_step=global_step,
-    #         decay_steps=train_config.learning_rate_decay, decay_rate=0.96,
-    #         staircase=True, name='learning_rate_with_decay'
-    #     )
-
     tf.summary.scalar('losses/learning_rate', learning_rate)
 
     return learning_rate
@@ -103,7 +85,12 @@ def clip_gradients_by_norm(grads_and_vars, add_to_summary=True):
     if add_to_summary:
         for grad, var in grads_and_vars:
             if grad is not None:
-                variable_summaries(grad, 'grad/{}'.format(var.name[:-2]))
+                variable_summaries(
+                    grad, 'grad/{}'.format(var.name[:-2]), 'full'
+                )
+                variable_summaries(
+                    tf.abs(grad), 'grad/abs/{}'.format(var.name[:-2]), 'full'
+                )
 
     # Clip by norm. Grad can be null when not training some modules.
     with tf.name_scope('clip_gradients_by_norm'):
@@ -122,6 +109,12 @@ def clip_gradients_by_norm(grads_and_vars, add_to_summary=True):
         for grad, var in grads_and_vars:
             if grad is not None:
                 variable_summaries(
-                    grad, 'clipped_grad/{}'.format(var.name[:-2]))
+                    grad, 'clipped_grad/{}'.format(var.name[:-2]), 'full'
+                )
+                variable_summaries(
+                    tf.abs(grad),
+                    'clipped_grad/{}'.format(var.name[:-2]),
+                    'full'
+                )
 
     return grads_and_vars

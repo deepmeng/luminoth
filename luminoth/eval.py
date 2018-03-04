@@ -4,40 +4,44 @@ import os
 import tensorflow as tf
 import time
 
-from luminoth.datasets import TFRecordDataset
+from luminoth.datasets import get_dataset
 from luminoth.models import get_model
-from luminoth.utils.config import (
-    get_model_config
-)
 from luminoth.utils.bbox_overlap import bbox_overlap
+from luminoth.utils.config import get_config
 from luminoth.utils.image_vis import image_vis_summaries
 
 
 @click.command(help='Evaluate trained (or training) models')
-@click.option('model_type', '--model', required=True, default='fasterrcnn')
 @click.option('dataset_split', '--split', default='val', help='Dataset split to use.')  # noqa
-@click.option('config_file', '--config', '-c', help='Config to use.')  # noqa
-@click.option('--job-dir', required=True, help='Directory from where to read saved models and write evaluation logs.')  # noqa
+@click.option('config_files', '--config', '-c', required=True, multiple=True, help='Config to use.')  # noqa
 @click.option('--watch/--no-watch', default=True, help='Keep watching checkpoint directory for new files.')  # noqa
 @click.option('--from-global-step', type=int, default=None, help='Consider only checkpoints after this global step')  # noqa
 @click.option('override_params', '--override', '-o', multiple=True, help='Override model config params.')  # noqa
-@click.option('--image-vis', is_flag=True, default=False, help='Display images in TensorBoard.')  # noqa
 @click.option('--files-per-class', type=int, default=10, help='How many files per class display in every epoch.')  # noqa
-def evaluate(model_type, dataset_split, config_file, job_dir, watch,
-             from_global_step, override_params, image_vis, files_per_class):
-    """
-    Evaluate models using dataset.
-    """
-    model_cls = get_model(model_type)
-    config = model_cls.base_config
+@click.option('--iou-threshold', type=float, default=0.5, help='IoU threshold to use.')  # noqa
+@click.option('--min-probability', type=float, default=0.5, help='Minimum probability to use.')  # noqa
+def eval(dataset_split, config_files, watch, from_global_step,
+         override_params, files_per_class, iou_threshold, min_probability):
+    """Evaluate models using dataset."""
 
-    config = get_model_config(
-        model_cls.base_config, config_file, override_params
-    )
+    # If the config file is empty, our config will be the base_config for the
+    # default model.
+    try:
+        config = get_config(config_files, override_params=override_params)
+    except KeyError:
+        raise KeyError('model.type should be set on the custom config.')
 
-    config.train.job_dir = job_dir or config.train.job_dir
-    # Only activate debug for image visualizations.
-    config.train.debug = image_vis
+    if not config.train.job_dir:
+        raise KeyError('`job_dir` should be set.')
+    if not config.train.run_name:
+        raise KeyError('`run_name` should be set.')
+
+    # `run_dir` is where the actual checkpoint and logs are located.
+    run_dir = os.path.join(config.train.job_dir, config.train.run_name)
+
+    # Only activate debug for if needed for debug visualization mode.
+    if not config.train.debug:
+        config.train.debug = config.eval.image_vis == 'debug'
 
     if config.train.debug or config.train.tf_debug:
         tf.logging.set_verbosity(tf.logging.DEBUG)
@@ -52,38 +56,48 @@ def evaluate(model_type, dataset_split, config_file, job_dir, watch,
     # Only a single run over the dataset to calculate metrics.
     config.train.num_epochs = 1
 
+    if config.model.network.with_rcnn:
+        config.model.rcnn.proposals.min_prob_threshold = min_probability
+    else:
+        config.model.rpn.proposals.min_prob_threshold = min_probability
+
     # Seed setup
     if config.train.seed:
         tf.set_random_seed(config.train.seed)
 
     # Set pretrained as not training
-    config.base_network.trainable = False
+    config.model.base_network.trainable = False
 
-    model = model_cls(config)
-    dataset = TFRecordDataset(config)
+    model_class = get_model(config.model.type)
+    model = model_class(config)
+    dataset_class = get_dataset(config.dataset.type)
+    dataset = dataset_class(config)
     train_dataset = dataset()
 
     train_image = train_dataset['image']
     train_objects = train_dataset['bboxes']
     train_filename = train_dataset['filename']
 
-    # TODO: This is not the best place to configure rank? Why is rank not
-    # transmitted through the queue
-    train_image.set_shape((None, None, 3))
-    # We add fake batch dimension to train data. TODO: DEFINITELY NOT THE BEST
-    # PLACE
-    train_image = tf.expand_dims(train_image, 0)
-
     # Build the graph of the model to evaluate, retrieving required
     # intermediate tensors.
-    prediction_dict = model(
-        train_image, train_objects
-    )
+    prediction_dict = model(train_image, train_objects)
 
-    pred = prediction_dict['classification_prediction']
-    pred_objects = pred['objects']
-    pred_objects_classes = pred['labels']
-    pred_objects_scores = pred['probs']
+    if config.model.network.with_rcnn:
+        pred = prediction_dict['classification_prediction']
+        pred_objects = pred['objects']
+        pred_objects_classes = pred['labels']
+        pred_objects_scores = pred['probs']
+    else:
+        # Force the num_classes to 1
+        config.model.network.num_classes = 1
+
+        pred = prediction_dict['rpn_prediction']
+        pred_objects = pred['proposals']
+        pred_objects_scores = pred['scores']
+        # When using only RPN all classes are 0.
+        pred_objects_classes = tf.zeros(
+            (tf.shape(pred_objects_scores)[0],), dtype=tf.int32
+        )
 
     # Retrieve *all* the losses from the model and calculate their streaming
     # means, so we get the loss over the whole dataset.
@@ -118,14 +132,15 @@ def evaluate(model_type, dataset_split, config_file, job_dir, watch,
         'train_objects': train_objects,
         'losses': losses,
         'prediction_dict': prediction_dict,
-        'filename': train_filename
+        'filename': train_filename,
+        'train_image': train_image
     }
 
     metrics_scope = '{}_metrics'.format(dataset_split)
 
     # Use global writer for all checkpoints. We don't want to write different
     # files for each checkpoint.
-    writer = tf.summary.FileWriter(config.train.job_dir)
+    writer = tf.summary.FileWriter(run_dir)
 
     files_to_visualize = {}
 
@@ -133,15 +148,17 @@ def evaluate(model_type, dataset_split, config_file, job_dir, watch,
     while True:
         # Get the checkpoint files to evaluate.
         try:
-            checkpoints = get_checkpoints(config, last_global_step)
+            checkpoints = get_checkpoints(
+                run_dir, last_global_step, last_only=not watch
+            )
         except ValueError as e:
             if not watch:
                 tf.logging.error('Missing checkpoint.')
                 raise e
 
             tf.logging.warning(
-                'Missing checkpoint; Checking again in a minute')
-            time.sleep(60)
+                'Missing checkpoint; Checking again in a moment')
+            time.sleep(5)
             continue
 
         for checkpoint in checkpoints:
@@ -154,10 +171,13 @@ def evaluate(model_type, dataset_split, config_file, job_dir, watch,
             try:
                 start = time.time()
                 evaluate_once(
-                    writer, saver, ops, config.network.num_classes, checkpoint,
-                    metrics_scope=metrics_scope, image_vis=image_vis,
+                    config, writer, saver, ops, checkpoint,
+                    metrics_scope=metrics_scope,
+                    image_vis=config.eval.image_vis,
                     files_per_class=files_per_class,
-                    files_to_visualize=files_to_visualize
+                    files_to_visualize=files_to_visualize,
+                    iou_threshold=iou_threshold,
+                    min_probability=min_probability
                 )
                 last_global_step = checkpoint['global_step']
                 tf.logging.info('Evaluated in {:.2f}s'.format(
@@ -168,27 +188,27 @@ def evaluate(model_type, dataset_split, config_file, job_dir, watch,
                 # checkpoints file, but it still hasn't been completely saved.
                 tf.logging.info(
                     'Checkpoint {} is not ready yet. '
-                    'Checking again in a minute.'.format(
+                    'Checking again in a moment.'.format(
                         checkpoint['file']
                     )
                 )
-                time.sleep(60)
+                time.sleep(5)
                 continue
 
         # If no watching was requested, finish the execution.
         if not watch:
             return
 
-        # Sleep for a minute and check for new checkpoints.
-        tf.logging.info('All checkpoints evaluated; sleeping for a minute')
-        time.sleep(60)
+        # Sleep for a moment and check for new checkpoints.
+        tf.logging.info('All checkpoints evaluated; sleeping for a moment')
+        time.sleep(5)
 
 
-def get_checkpoints(config, from_global_step=None):
+def get_checkpoints(run_dir, from_global_step=None, last_only=False):
     """Return all available checkpoints.
 
     Args:
-        config: Run configuration file, where the checkpoint dir is present.
+        run_dir: Directory where the checkpoints are located.
         from_global_step (int): Only return checkpoints after this global step.
             The comparison is *strict*. If ``None``, returns all available
             checkpoints.
@@ -198,53 +218,52 @@ def get_checkpoints(config, from_global_step=None):
         checkpoints found.
 
     Raises:
-        ValueError: If there are no checkpoints on the ``train.job_dir`` key
-            of `config`.
+        ValueError: If there are no checkpoints in ``run_dir``.
     """
     # The latest checkpoint file should be the last item of
     # `all_model_checkpoint_paths`, according to the CheckpointState protobuf
     # definition.
-    ckpt = tf.train.get_checkpoint_state(config.train.job_dir)
+    # TODO: Must check if the checkpoints are complete somehow.
+    ckpt = tf.train.get_checkpoint_state(run_dir)
     if not ckpt or not ckpt.all_model_checkpoint_paths:
-        raise ValueError('Could not find checkpoint in {}.'.format(
-            config.train.job_dir
-        ))
+        raise ValueError('Could not find checkpoint in {}.'.format(run_dir))
 
-    # TODO: Any other way to get the global_step?
-    checkpoints = [
+    # TODO: Any other way to get the global_step? (Same as in `checkpoints`.)
+    checkpoints = sorted([
         {'global_step': int(path.split('-')[-1]), 'file': path}
         for path in ckpt.all_model_checkpoint_paths
-    ]
+    ], key=lambda c: c['global_step'])
 
-    # Get the run name from the checkpoint path. Do it before filtering the
-    # list, as it may end up empty.
-    # TODO: Can't it be set somewhere else?
-    config.train.run_name = os.path.split(
-        os.path.dirname(checkpoints[0]['file'])
-    )[-1]
-
-    if from_global_step is not None:
+    if last_only:
+        checkpoints = checkpoints[-1:]
+        tf.logging.info(
+            'Using last checkpoint in run_dir, global_step = {}'.format(
+                checkpoints[0]['global_step']
+            )
+        )
+    elif from_global_step is not None:
         checkpoints = [
             c for c in checkpoints
             if c['global_step'] > from_global_step
         ]
 
         tf.logging.info(
-            'Found %s checkpoints in job_dir with global_step > %s',
+            'Found %s checkpoints in run_dir with global_step > %s',
             len(checkpoints), from_global_step,
         )
 
     else:
         tf.logging.info(
-            'Found {} checkpoints in job_dir'.format(len(checkpoints))
+            'Found {} checkpoints in run_dir'.format(len(checkpoints))
         )
 
     return checkpoints
 
 
-def evaluate_once(writer, saver, ops, num_classes, checkpoint,
-                  metrics_scope='metrics', image_vis=False,
-                  files_per_class=None, files_to_visualize=None):
+def evaluate_once(config, writer, saver, ops, checkpoint,
+                  metrics_scope='metrics', image_vis=None,
+                  files_per_class=None, files_to_visualize=None,
+                  iou_threshold=0.5, min_probability=0.5):
     """Run the evaluation once.
 
     Create a new session with the previously-built graph, run it through the
@@ -253,11 +272,13 @@ def evaluate_once(writer, saver, ops, num_classes, checkpoint,
 
     Args:
         config: Config object for the model.
+        writer: Summary writers.
         saver: Saver object to restore checkpoint parameters.
         ops (dict): All the operations needed to successfully run the model.
             Expects the following keys: ``init_op``, ``metric_ops``,
             ``pred_objects``, ``pred_objects_classes``,
-            ``pred_objects_scores``, ``train_objects``, ``losses`.
+            ``pred_objects_scores``, ``train_objects``, ``losses``,
+            ``train_image``.
         checkpoint (dict): Checkpoint-related data.
             Expects the following keys: ``global_step``, ``file``.
     """
@@ -277,7 +298,14 @@ def evaluate_once(writer, saver, ops, num_classes, checkpoint,
         coord = tf.train.Coordinator()
         threads = tf.train.start_queue_runners(sess=sess, coord=coord)
 
+        total_evaluated = 0
+        start_time = time.time()
+
         try:
+            track_start = start_time
+            track_count = 0
+            period_detected_count = 0
+            period_detected_max = 0
             while not coord.should_stop():
                 fetches = {
                     'metric_ops': ops['metric_ops'],
@@ -285,13 +313,14 @@ def evaluate_once(writer, saver, ops, num_classes, checkpoint,
                     'classes': ops['pred_objects_classes'],
                     'scores': ops['pred_objects_scores'],
                     'gt_bboxes': ops['train_objects'],
+                    'losses': ops['losses'],
+                    'filename': ops['filename'],
                 }
-                if image_vis:
+                if image_vis is not None:
                     fetches['prediction_dict'] = ops['prediction_dict']
-                    fetches['filename'] = ops['filename']
+                    fetches['train_image'] = ops['train_image']
 
                 batch_fetched = sess.run(fetches)
-
                 output_per_batch['bboxes'].append(batch_fetched.get('bboxes'))
                 output_per_batch['classes'].append(batch_fetched['classes'])
                 output_per_batch['scores'].append(batch_fetched['scores'])
@@ -301,10 +330,16 @@ def evaluate_once(writer, saver, ops, num_classes, checkpoint,
                 batch_gt_classes = batch_gt_objects[:, 4]
                 output_per_batch['gt_classes'].append(batch_gt_classes)
 
-                val_losses = sess.run(ops['losses'])
+                val_losses = batch_fetched['losses']
 
-                if fetches:
-                    filename = batch_fetched['filename'][:-4].decode('utf-8')
+                num_detected = len(batch_fetched['scores'])
+                period_detected_count += num_detected
+                period_detected_max = max(period_detected_max, num_detected)
+                if period_detected_max == len(batch_fetched['scores']):
+                    period_max_img = batch_fetched['filename']
+
+                if image_vis is not None:
+                    filename = batch_fetched['filename'].decode('utf-8')
                     visualize_file = False
                     for gt_class in batch_gt_classes:
                         cls_files = files_to_visualize.get(
@@ -323,40 +358,87 @@ def evaluate_once(writer, saver, ops, num_classes, checkpoint,
                     if visualize_file:
                         image_summaries = image_vis_summaries(
                             batch_fetched['prediction_dict'],
-                            extra_tag=filename
+                            with_rcnn=config.model.network.with_rcnn,
+                            extra_tag=filename,
+                            image_visualization_mode=image_vis,
+                            image=batch_fetched['train_image'],
+                            gt_bboxes=batch_fetched['gt_bboxes']
                         )
                         for image_summary in image_summaries:
                             writer.add_summary(
                                 image_summary, checkpoint['global_step']
                             )
 
+                total_evaluated += 1
+                track_count += 1
+
+                track_end = time.time()
+                if track_end - track_start > 20.:
+                    click.echo(
+                        '{} processed in {:.2f}s (global {:.2f} images/s, '
+                        'period {:.2f} images/s, avg dets {:.2f}, '
+                        'max dets {} on {})'.format(
+                            total_evaluated, track_end - start_time,
+                            total_evaluated / (track_end - start_time),
+                            track_count / (track_end - track_start),
+                            period_detected_count / track_count,
+                            period_detected_max, period_max_img
+                        ))
+                    track_count = 0
+                    track_start = track_end
+                    period_detected_count = 0
+                    period_detected_max = 0
+
         except tf.errors.OutOfRangeError:
 
             # Save final evaluation stats into summary under the checkpoint's
             # global step.
-            map_0_5, per_class_0_5 = calculate_map(
-                output_per_batch, num_classes, 0.5
+            map_at_iou, per_class_at_iou = calculate_map(
+                output_per_batch, config.model.network.num_classes,
+                iou_threshold
             )
+
+            tf.logging.info('Finished evaluation at step {}.'.format(
+                checkpoint['global_step']))
+            tf.logging.info('Evaluated {} images.'.format(total_evaluated))
+            tf.logging.info('mAP@{}@{} = {:.2f}'.format(
+                iou_threshold, min_probability, map_at_iou))
 
             # TODO: Find a way to generate these summaries automatically, or
             # less manually.
             summary = [
                 tf.Summary.Value(
-                    tag='{}/mAP@0.5'.format(metrics_scope),
-                    simple_value=map_0_5
+                    tag='{}/mAP@{}@{}'.format(
+                        metrics_scope, iou_threshold, min_probability
+                    ),
+                    simple_value=map_at_iou
+                ),
+                tf.Summary.Value(
+                    tag='{}/total_evaluated'.format(metrics_scope),
+                    simple_value=total_evaluated
+                ),
+                tf.Summary.Value(
+                    tag='{}/evaluation_time'.format(metrics_scope),
+                    simple_value=time.time() - start_time
                 ),
             ]
 
+            for idx, val in enumerate(per_class_at_iou):
+                tf.logging.debug('AP@{}@{} for {} = {:.2f}'.format(
+                    iou_threshold, min_probability, idx, val))
+                summary.append(tf.Summary.Value(
+                    tag='{}/AP@{}@{}/{}'.format(
+                        metrics_scope, iou_threshold, min_probability, idx
+                    ),
+                    simple_value=val
+                ))
+
             for loss_name, loss_value in val_losses.items():
+                tf.logging.debug('{} loss = {:.4f}'.format(
+                    loss_name, loss_value))
                 summary.append(tf.Summary.Value(
                     tag=loss_name,
                     simple_value=loss_value
-                ))
-
-            for idx, val in enumerate(per_class_0_5):
-                summary.append(tf.Summary.Value(
-                    tag='{}/AP@0.5/{}'.format(metrics_scope, idx),
-                    simple_value=val
                 ))
 
             total_bboxes_per_batch = [
@@ -531,3 +613,7 @@ def calculate_map(output_per_batch, num_classes, iou_threshold=0.5):
     mean_ap = np.mean(ap_per_class)
 
     return mean_ap, ap_per_class
+
+
+if __name__ == '__main__':
+    eval()

@@ -6,8 +6,7 @@ from luminoth.models.fasterrcnn.rcnn import RCNN
 from luminoth.models.fasterrcnn.rpn import RPN
 from luminoth.models.base import TruncatedBaseNetwork
 from luminoth.utils.anchors import generate_anchors_reference
-from luminoth.utils.config import get_base_config
-from luminoth.utils.vars import variable_summaries, get_saver
+from luminoth.utils.vars import VAR_LOG_LEVELS, variable_summaries, get_saver
 
 
 class FasterRCNN(snt.AbstractModule):
@@ -20,9 +19,6 @@ class FasterRCNN(snt.AbstractModule):
     It is also responsible for building the anchor reference which is used in
     graph for generating the dynamic anchors.
     """
-
-    base_config = get_base_config(__file__)
-
     def __init__(self, config, name='fasterrcnn'):
         super(FasterRCNN, self).__init__(name=name)
 
@@ -33,11 +29,11 @@ class FasterRCNN(snt.AbstractModule):
 
         # Total number of classes to classify. If not using RCNN then it is not
         # used. TODO: Make it *more* optional.
-        self._num_classes = config.network.num_classes
+        self._num_classes = config.model.network.num_classes
 
         # Generate network with RCNN thus allowing for classification of
         # objects and not just finding them.
-        self._with_rcnn = config.network.with_rcnn
+        self._with_rcnn = config.model.network.with_rcnn
 
         # Turn on debug mode with returns more Tensors which can be used for
         # better visualization and (of course) debugging.
@@ -46,10 +42,10 @@ class FasterRCNN(snt.AbstractModule):
 
         # Anchor config, check out the docs of base_config.yml for a better
         # understanding of how anchors work.
-        self._anchor_base_size = config.anchors.base_size
-        self._anchor_scales = np.array(config.anchors.scales)
-        self._anchor_ratios = np.array(config.anchors.ratios)
-        self._anchor_stride = config.anchors.stride
+        self._anchor_base_size = config.model.anchors.base_size
+        self._anchor_scales = np.array(config.model.anchors.scales)
+        self._anchor_ratios = np.array(config.model.anchors.ratios)
+        self._anchor_stride = config.model.anchors.stride
 
         # Anchor reference for building dynamic anchors for each image in the
         # computation graph.
@@ -61,25 +57,23 @@ class FasterRCNN(snt.AbstractModule):
         self._num_anchors = self._anchor_reference.shape[0]
 
         # Weights used to sum each of the losses of the submodules
-        self._rpn_cls_loss_weight = config.loss.rpn_cls_loss_weight
-        self._rpn_reg_loss_weight = config.loss.rpn_reg_loss_weights
+        self._rpn_cls_loss_weight = config.model.loss.rpn_cls_loss_weight
+        self._rpn_reg_loss_weight = config.model.loss.rpn_reg_loss_weights
 
-        self._rcnn_cls_loss_weight = config.loss.rcnn_cls_loss_weight
-        self._rcnn_reg_loss_weight = config.loss.rcnn_reg_loss_weights
+        self._rcnn_cls_loss_weight = config.model.loss.rcnn_cls_loss_weight
+        self._rcnn_reg_loss_weight = config.model.loss.rcnn_reg_loss_weights
         self._losses_collections = ['fastercnn_losses']
 
         # We want the pretrained model to be outside the FasterRCNN name scope.
-        self.base_network = TruncatedBaseNetwork(
-            config.base_network, parent_name=self.module_name
-        )
+        self.base_network = TruncatedBaseNetwork(config.model.base_network)
 
-    def _build(self, image, gt_boxes=None, is_training=True):
+    def _build(self, image, gt_boxes=None, is_training=False):
         """
         Returns bounding boxes and classification probabilities.
 
         Args:
             image: A tensor with the image.
-                Its shape should be `(1, height, width, 3)`.
+                Its shape should be `(height, width, 3)`.
             gt_boxes: A tensor with all the ground truth boxes of that image.
                 Its shape should be `(num_gt_boxes, 5)`
                 Where for each gt box we have (x1, y1, x2, y2, label),
@@ -99,31 +93,39 @@ class FasterRCNN(snt.AbstractModule):
         # A Tensor with the feature map for the image,
         # its shape should be `(feature_height, feature_width, 512)`.
         # The shape depends of the pretrained network in use.
-        conv_feature_map = self.base_network(image, is_training=is_training)
+
+        # Set rank and last dimension before using base network
+        # TODO: Why does it loose information when using queue?
+        image.set_shape((None, None, 3))
+
+        conv_feature_map = self.base_network(
+            tf.expand_dims(image, 0), is_training=is_training
+        )
 
         # The RPN submodule which generates proposals of objects.
         self._rpn = RPN(
-            self._num_anchors, self._config.rpn,
+            self._num_anchors, self._config.model.rpn,
             debug=self._debug, seed=self._seed
         )
         if self._with_rcnn:
             # The RCNN submodule which classifies RPN's proposals and
             # classifies them as background or a specific class.
             self._rcnn = RCNN(
-                self._num_classes, self._config.rcnn,
+                self._num_classes, self._config.model.rcnn,
                 debug=self._debug, seed=self._seed
             )
 
-        image_shape = tf.shape(image)[1:3]
+        image_shape = tf.shape(image)[0:2]
 
         variable_summaries(
-            conv_feature_map, 'conv_feature_map', ['rpn'])
+            conv_feature_map, 'conv_feature_map', 'reduced'
+        )
 
         # Generate anchors for the image based on the anchor reference.
         all_anchors = self._generate_anchors(tf.shape(conv_feature_map))
         rpn_prediction = self._rpn(
             conv_feature_map, image_shape, all_anchors,
-            gt_boxes=gt_boxes
+            gt_boxes=gt_boxes, is_training=is_training
         )
 
         prediction_dict = {
@@ -137,13 +139,16 @@ class FasterRCNN(snt.AbstractModule):
             prediction_dict['anchor_reference'] = tf.convert_to_tensor(
                 self._anchor_reference
             )
-            prediction_dict['gt_boxes'] = gt_boxes
+            if gt_boxes is not None:
+                prediction_dict['gt_boxes'] = gt_boxes
             prediction_dict['conv_feature_map'] = conv_feature_map
 
         if self._with_rcnn:
+            proposals = tf.stop_gradient(rpn_prediction['proposals'])
             classification_pred = self._rcnn(
-                conv_feature_map, rpn_prediction['proposals'],
-                image_shape, gt_boxes=gt_boxes, is_training=is_training
+                conv_feature_map, proposals,
+                image_shape, self.base_network,
+                gt_boxes=gt_boxes, is_training=is_training
             )
 
             prediction_dict['classification_prediction'] = classification_pred
@@ -321,14 +326,31 @@ class FasterRCNN(snt.AbstractModule):
 
         return tf.summary.merge(summaries)
 
+    @property
+    def vars_summary(self):
+        return {
+            key: tf.summary.merge_all(key=collection)
+            for key, collections in VAR_LOG_LEVELS.items()
+            for collection in collections
+        }
+
     def get_trainable_vars(self):
         """Get trainable vars included in the module.
         """
         trainable_vars = snt.get_variables_in_module(self)
-        if self._config.base_network.trainable:
+        if self._config.model.base_network.trainable:
             pretrained_trainable_vars = self.base_network.get_trainable_vars()
-            tf.logging.info('Training {} vars from pretrained module.'.format(
-                len(pretrained_trainable_vars)))
+            if len(pretrained_trainable_vars):
+                tf.logging.info(
+                    'Training {} vars from pretrained module; '
+                    'from "{}" to "{}".'.format(
+                        len(pretrained_trainable_vars),
+                        pretrained_trainable_vars[0].name,
+                        pretrained_trainable_vars[-1].name,
+                    )
+                )
+            else:
+                tf.logging.info('No vars from pretrained module to train.')
             trainable_vars += pretrained_trainable_vars
         else:
             tf.logging.info('Not training variables from pretrained module')
